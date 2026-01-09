@@ -417,7 +417,9 @@ def main():
         raise FileNotFoundError(f"No MAT files found in: {MATLAB_DIR}")
 
     OUT_FIF_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_FIF_DIR / ".gitkeep").touch()
     OUT_BIDS_ROOT.mkdir(parents=True, exist_ok=True)
+    (OUT_BIDS_ROOT / ".gitkeep").touch()
 
     for mat_path in mat_files:
         subject, session = parse_subject_session_from_filename(mat_path)
