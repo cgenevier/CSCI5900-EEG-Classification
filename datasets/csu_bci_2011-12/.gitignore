@@ -1,0 +1,8 @@
+original_json/*
+!original_json/**/.gitkeep
+raw_fif/*
+!raw_fif/**/.gitkeep
+bids/*
+!bids/**/.gitkeep
+preprocessed_fif/*
+!preprocessed_fif/**/.gitkeep
