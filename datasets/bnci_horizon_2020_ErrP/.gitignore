@@ -1,6 +1,8 @@
 original_matlab/*
 !original_matlab/**/.gitkeep
-out_fif/*
-!out_fif/**/.gitkeep
-out_bids/*
-!out_bids/**/.gitkeep
+raw_fif/*
+!raw_fif/**/.gitkeep
+bids/*
+!bids/**/.gitkeep
+preprocessed_fif/*
+!preprocessed_fif/**/.gitkeep
