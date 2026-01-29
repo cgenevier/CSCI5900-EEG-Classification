@@ -218,9 +218,17 @@ def mat_to_mne_per_run(mat_path: Path):
 
     eeg0 = extract_eeg(runs[0])
     n_ch = eeg0.shape[1]
-
+    
     ch_names = meta0.get("ch_names", None)
-    if not ch_names or len(ch_names) != n_ch:
+    if ch_names:
+        # If there's one extra label (very common), trim it.
+        if len(ch_names) == n_ch + 1:
+            ch_names = ch_names[:n_ch]
+        # If labels still don't match, fall back.
+        if len(ch_names) != n_ch:
+            ch_names = None
+
+    if not ch_names:
         ch_names = [f"ch_{i}" for i in range(n_ch)]
 
     for i in range(n_runs):
@@ -234,6 +242,9 @@ def mat_to_mne_per_run(mat_path: Path):
         data = eeg.T
         info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=[DEFAULT_CH_TYPE] * n_ch)
         raw = mne.io.RawArray(data, info, verbose=False)
+
+        montage = mne.channels.make_standard_montage("standard_1005")
+        raw.set_montage(montage, match_case=False, on_missing="warn")
 
         events_df = extract_events(runs[i])
         events_df["mat_run_index0"] = i
@@ -286,7 +297,15 @@ def mat_to_mne_concatenated(mat_path: Path):
     n_ch = eeg0.shape[1]
 
     ch_names = meta0.get("ch_names", None)
-    if not ch_names or len(ch_names) != n_ch:
+    if ch_names:
+        # If there's one extra label (very common), trim it.
+        if len(ch_names) == n_ch + 1:
+            ch_names = ch_names[:n_ch]
+        # If labels still don't match, fall back.
+        if len(ch_names) != n_ch:
+            ch_names = None
+
+    if not ch_names:
         ch_names = [f"ch_{i}" for i in range(n_ch)]
 
     eeg_runs = []
@@ -305,6 +324,9 @@ def mat_to_mne_concatenated(mat_path: Path):
 
     info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=[DEFAULT_CH_TYPE] * n_ch)
     raw = mne.io.RawArray(data, info, verbose=False)
+
+    montage = mne.channels.make_standard_montage("standard_1005")
+    raw.set_montage(montage, match_case=False, on_missing="warn")
 
     run_offsets = np.cumsum([0] + samples_per_run[:-1])
 

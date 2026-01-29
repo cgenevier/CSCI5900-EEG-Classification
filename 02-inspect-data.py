@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from operator import truediv
 from pathlib import Path
 import json
 import numpy as np
 import pandas as pd
 import mne
+import matplotlib.pyplot as plt
 
 # -------------------------
 # Config
@@ -13,31 +13,68 @@ import mne
 RAW_FIF_ROOT = Path("datasets/bnci_horizon_2020_ErrP/raw_fif")
 TASK = "errp"
 
-# If you only want to inspect one subject/session/run, set these to strings like "01"
+# Optional filters
 ONLY_SUBJECT = None   # e.g., "01"
 ONLY_SESSION = None   # e.g., "01"
 ONLY_RUN = None       # e.g., "01"
 
-# Plot toggles (leave False for headless / CI)
-SHOW_RAW_PLOT = False
-SHOW_PSD_PLOT = False
-SHOW_EVENTS_PLOT = False
+# Output locations
+QC_OUT_ROOT = Path("datasets/bnci_horizon_2020_ErrP/qc_outputs")
+QC_OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-# How many seconds of raw to display when plotting
-RAW_PLOT_DURATION_SEC = 10.0
+QC_SUMMARY_CSV = QC_OUT_ROOT / "qc_summary.csv"
+QC_CHANNEL_CSV = QC_OUT_ROOT / "qc_channel_stats.csv"
+PLOTS_DIR = QC_OUT_ROOT / "qc_plots"
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_RAW_SNIPPET_DIR = PLOTS_DIR / "raw_snippet"
+PLOTS_RAW_OVERVIEW_DIR = PLOTS_DIR / "raw_overview"
+PLOTS_PSD_DIR = PLOTS_DIR / "psd"
+PLOTS_EVENTS_DIR = PLOTS_DIR / "events"
 
-# Event codes you expect in this dataset (BNCI ErrP)
+for d in [PLOTS_RAW_SNIPPET_DIR, PLOTS_RAW_OVERVIEW_DIR, PLOTS_PSD_DIR, PLOTS_EVENTS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# Plot config (saved to disk; no interactive popups)
+SAVE_RAW_SNIPPET_PLOT = True
+SAVE_PSD_PLOT = True
+SAVE_EVENTS_PLOT = True
+
+RAW_SNIPPET_SEC = 10.0  # how much raw to plot (from start of recording)
+PSD_FMIN = 0.1
+PSD_FMAX = 120.0
+
+# QC windows / sampling control
+# How much data to use for computing per-channel stats and correlation:
+# - Set to None for full recording (may be slower).
+# - Recommended: 60–180 seconds to capture variability.
+QC_WINDOW_SEC = 60.0
+
+# To avoid pulling huge arrays into memory, we compute stats and correlations on decimated data:
+# This caps the number of samples used per channel.
+MAX_SAMPLES_FOR_STATS = 50_000  # affects median/MAD and correlation computations
+
+# Event codes expected in BNCI ErrP
 EXPECTED_EVENT_CODES = {1, 2, 4, 5, 6, 8, 9, 10}
 
-# Amplitude QC window (seconds from start of recording)
-AMP_QC_WINDOW_SEC = 5.0
+# Thresholds for dead channel detection (relative to run): tuneable, but these are good defaults
+# - std_ratio < 0.05 means <5% of typical amplitude
+# - ptp_ratio < 0.05 similarly catches tiny peak-to-peak
+# - also catch true flatlines via variance ~ 0 (numerical)
+DEAD_STD_RATIO = 0.05
+DEAD_PTP_RATIO = 0.05
+DEAD_MAD_RATIO = 0.05
+NEAR_ZERO_VAR = 1e-18  # V^2; extremely tiny
 
-# Amplitude QC is computed after per-channel demeaning (removes full-DC offsets).
-# Thresholds are intentionally generous; they're meant to catch unit mistakes / extreme issues.
-DEMEANED_MEDIAN_WARN_V = 1e-3     # 1000 µV median is suspicious
-DEMEANED_P999_WARN_V = 2e-3       # 2000 µV p99.9 is suspicious
-DEMEANED_MAX_WARN_V = 1e-2        # 10 mV max spike (after demeaning) is noteworthy
+# Thresholds for basic channel QC (in Volts)
+# These are intentionally generous; tune for your dataset.
+STD_MIN_V = 1e-9        # ~0 => flatline/dead
+STD_MAX_V = 5e-3        # very large std (5000 µV) suspicious
+PTP_MAX_V = 2e-2        # 20 mV peak-to-peak suspicious
+MAD_MAX_V = 2e-3        # 2000 µV MAD suspicious
 
+# Correlation thresholds
+MEAN_ABS_CORR_MIN = 0.05   # near-zero correlation to everyone is suspicious
+MEAN_ABS_CORR_MAX = 0.98   # extremely high correlation across channels is suspicious (reference bleed / duplication)
 
 # -------------------------
 # Helpers
@@ -58,7 +95,7 @@ def find_sidecars(fif_path: Path):
     base = fif_path.name.replace("_raw.fif", "")
     events_csv = fif_path.parent / f"{base}_events.csv"
     meta_json = fif_path.parent / f"{base}_meta.json"
-    return events_csv, meta_json
+    return events_csv, meta_json, base
 
 
 def load_events_csv(events_csv: Path) -> pd.DataFrame:
@@ -86,58 +123,253 @@ def events_df_to_mne_events(events_df: pd.DataFrame, sample_col: str = "sample0"
     ).astype(int)
 
 
-def demean_per_channel(x: np.ndarray) -> np.ndarray:
-    """x shape: (n_channels, n_times)"""
-    if x.size == 0:
-        return x
-    return x - x.mean(axis=1, keepdims=True)
+def _select_qc_segment(raw: mne.io.BaseRaw, window_sec: float | None) -> tuple[int, int]:
+    """Return (start, stop) sample indices for QC segment."""
+    sfreq = float(raw.info["sfreq"])
+    n_times = int(raw.n_times)
+    start = 0
+    if window_sec is None:
+        stop = n_times
+    else:
+        stop = min(n_times, int(round(window_sec * sfreq)))
+        stop = max(stop, 1)
+    return start, stop
 
 
-def amplitude_stats_demeaned(raw: mne.io.BaseRaw, window_sec: float) -> dict:
+def _decimation_factor(n_samples: int, max_samples: int) -> int:
+    """Compute integer decimation factor so that n_samples/decim <= max_samples."""
+    if n_samples <= max_samples:
+        return 1
+    return int(np.ceil(n_samples / max_samples))
+
+
+def compute_channel_stats(
+    raw: mne.io.BaseRaw,
+    picks: np.ndarray,
+    window_sec: float | None,
+    max_samples: int
+) -> pd.DataFrame:
     """
-    Compute robust amplitude stats on EEG channels, after demeaning per channel.
-    Uses first `window_sec` seconds to avoid loading full file.
+    Compute per-channel stats on a segment of raw data using decimated samples:
+      - mean, std, var
+      - min, max, peak-to-peak
+      - median, MAD (median absolute deviation)
+    Returns a DataFrame indexed by channel name.
+    """
+    start, stop = _select_qc_segment(raw, window_sec)
+    n_samples = stop - start
+    decim = _decimation_factor(n_samples, max_samples)
+
+    data = raw.get_data(picks=picks, start=start, stop=stop, reject_by_annotation="omit")
+    # decimate in time to cap sample count
+    data = data[:, ::decim]  # shape: (n_ch, n_t)
+
+    ch_names = [raw.ch_names[p] for p in picks]
+
+    mean = data.mean(axis=1)
+    var = data.var(axis=1, ddof=0)
+    std = np.sqrt(var)
+    mn = data.min(axis=1)
+    mx = data.max(axis=1)
+    ptp = mx - mn
+
+    med = np.median(data, axis=1)
+    mad = np.median(np.abs(data - med[:, None]), axis=1)
+
+    df = pd.DataFrame(
+        {
+            "ch_name": ch_names,
+            "qc_window_sec": float(window_sec) if window_sec is not None else np.nan,
+            "qc_samples_used": data.shape[1],
+            "decim": decim,
+            "mean_v": mean,
+            "var_v2": var,
+            "std_v": std,
+            "min_v": mn,
+            "max_v": mx,
+            "ptp_v": ptp,
+            "median_v": med,
+            "mad_v": mad,
+        }
+    )
+    return df
+
+
+def compute_mean_abs_correlation(
+    raw: mne.io.BaseRaw,
+    picks: np.ndarray,
+    window_sec: float | None,
+    max_samples: int
+) -> pd.DataFrame:
+    """
+    Compute per-channel mean absolute correlation with all other channels
+    (on decimated data). Flags suspiciously low/high mean abs corr.
+    """
+    start, stop = _select_qc_segment(raw, window_sec)
+    n_samples = stop - start
+    decim = _decimation_factor(n_samples, max_samples)
+
+    data = raw.get_data(picks=picks, start=start, stop=stop, reject_by_annotation="omit")
+    data = data[:, ::decim]  # (n_ch, n_t)
+
+    # Demean each channel to reduce correlation inflation from DC offsets
+    data = data - data.mean(axis=1, keepdims=True)
+
+    # Corrcoef expects rows as variables if rowvar=True; our rows are channels
+    C = np.corrcoef(data)
+    # Replace NaNs (can occur if a channel is flat) with 0
+    C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+
+    n_ch = C.shape[0]
+    mean_abs_corr = []
+    for i in range(n_ch):
+        others = np.abs(np.delete(C[i, :], i))
+        mean_abs_corr.append(float(np.mean(others)) if others.size else 0.0)
+
+    ch_names = [raw.ch_names[p] for p in picks]
+    df = pd.DataFrame(
+        {
+            "ch_name": ch_names,
+            "qc_window_sec": float(window_sec) if window_sec is not None else np.nan,
+            "qc_samples_used": data.shape[1],
+            "decim": decim,
+            "mean_abs_corr": mean_abs_corr,
+        }
+    )
+    return df
+
+
+def save_raw_snippet_plot(raw: mne.io.BaseRaw, fif_base: str, out_dir: Path, duration_sec: float, max_channels: int = 20):
+    """
+    Save a static multi-channel raw snippet plot (matplotlib).
+    Fix: remove per-channel DC offset before scaling so lines aren't flat.
+    """
+    sfreq = float(raw.info["sfreq"])
+    stop = min(int(raw.n_times), int(round(duration_sec * sfreq)))
+    stop = max(stop, 1)
+
+    picks = mne.pick_types(raw.info, eeg=True, meg=False, eog=False, stim=False, misc=False)
+    if max_channels is not None:
+        picks = picks[: min(max_channels, len(picks))]
+
+    data = raw.get_data(picks=picks, start=0, stop=stop)
+    times = np.arange(data.shape[1]) / sfreq
+
+    # Remove per-channel DC offset (median is robust)
+    data_centered = data - np.median(data, axis=1, keepdims=True)
+
+    # Robust scale using MAD across all plotted data
+    med = np.median(data_centered)
+    mad = np.median(np.abs(data_centered - med))
+    scale = 6 * mad  # ~4-6*MAD gives a nice visible scale
+    if not np.isfinite(scale) or scale <= 0:
+        scale = np.std(data_centered) if np.std(data_centered) > 0 else 1e-6
+
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111)
+
+    offsets = np.arange(len(picks))[::-1]
+    for i, p in enumerate(picks):
+        ax.plot(times, data_centered[i] / scale + offsets[i], linewidth=0.7)
+
+    ax.set_yticks(offsets)
+    ax.set_yticklabels([raw.ch_names[p] for p in picks])
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"{fif_base}: Raw EEG snippet (first {duration_sec:.1f}s, median-centered, scaled)")
+    ax.grid(True, alpha=0.2)
+
+    out_path = out_dir / f"{fif_base}_raw_snippet_{int(duration_sec)}s.png"
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def save_raw_overview_plot(
+    raw: mne.io.BaseRaw,
+    fif_base: str,
+    out_dir: Path,
+    max_points: int = 20000,
+    max_channels: int = 20,
+):
+    """
+    Save an overview plot across the *entire* recording by decimating in time.
+    This makes it feasible to view the whole run without massive files.
+
+    - max_points caps the number of time points plotted per channel
+    - max_channels limits displayed channels (first N EEG channels)
     """
     sfreq = float(raw.info["sfreq"])
     n_times = int(raw.n_times)
 
-    sample_len = int(min(n_times, max(1, int(sfreq * window_sec))))
     picks = mne.pick_types(raw.info, eeg=True, meg=False, eog=False, stim=False, misc=False)
+    if max_channels is not None:
+        picks = picks[: min(max_channels, len(picks))]
 
-    if len(picks) == 0:
-        return {
-            "demeaned_median_abs_v_firstwin": float("nan"),
-            "demeaned_p999_abs_v_firstwin": float("nan"),
-            "demeaned_max_abs_v_firstwin": float("nan"),
-            "demeaned_max_channel_firstwin": None,
-        }
+    decim = int(np.ceil(n_times / max_points)) if n_times > max_points else 1
 
-    data, _ = raw[picks, :sample_len]  # (n_eeg, sample_len)
-    data = demean_per_channel(data)
-    abs_data = np.abs(data)
+    data = raw.get_data(picks=picks, start=0, stop=n_times)
+    data = data[:, ::decim]
+    times = (np.arange(data.shape[1]) * decim) / sfreq
 
-    med = float(np.median(abs_data))
-    p999 = float(np.percentile(abs_data, 99.9))
-    max_abs = float(np.max(abs_data))
+    # Median-center each channel to remove DC offsets
+    data_centered = data - np.median(data, axis=1, keepdims=True)
 
-    # Identify which EEG channel produced the max (within this window)
-    flat = int(np.argmax(abs_data))
-    ch_i, _t_i = np.unravel_index(flat, abs_data.shape)
-    max_ch_name = raw.ch_names[picks[ch_i]]
+    # Robust scale from MAD of centered data
+    med = np.median(data_centered)
+    mad = np.median(np.abs(data_centered - med))
+    scale = 6 * mad
+    if not np.isfinite(scale) or scale <= 0:
+        scale = np.std(data_centered) if np.std(data_centered) > 0 else 1e-6
 
-    return {
-        "demeaned_median_abs_v_firstwin": med,
-        "demeaned_p999_abs_v_firstwin": p999,
-        "demeaned_max_abs_v_firstwin": max_abs,
-        "demeaned_max_channel_firstwin": max_ch_name,
-    }
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111)
+
+    offsets = np.arange(len(picks))[::-1]
+    for i, p in enumerate(picks):
+        ax.plot(times, data_centered[i] / scale + offsets[i], linewidth=0.5)
+
+    ax.set_yticks(offsets)
+    ax.set_yticklabels([raw.ch_names[p] for p in picks])
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"{fif_base}: Raw EEG overview (entire run, decim={decim}, median-centered, scaled)")
+    ax.grid(True, alpha=0.2)
+
+    out_path = out_dir / f"{fif_base}_raw_overview_decim{decim}_ch{len(picks)}.png"
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def save_psd_plot(raw: mne.io.BaseRaw, fif_base: str, out_dir: Path, fmin: float, fmax: float):
+    """
+    Save PSD plot to disk (uses MNE's PSD plotting, but non-interactive).
+    PSD is computed across the recording by default unless raw is cropped.
+    """
+    psd = raw.compute_psd(fmin=fmin, fmax=fmax)
+    fig = psd.plot(show=False, average=False)
+    out_path = out_dir / f"{fif_base}_psd_{fmin:.1f}-{fmax:.1f}Hz.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def save_events_plot(events_df: pd.DataFrame, sfreq: float, fif_base: str, out_dir: Path):
+    """
+    Save events plot to disk (non-interactive).
+    """
+    if len(events_df) == 0:
+        return
+    events = events_df_to_mne_events(events_df, sample_col="sample0")
+    fig = mne.viz.plot_events(events, sfreq=sfreq, first_samp=0, show=False)
+    out_path = out_dir / f"{fif_base}_events.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 # -------------------------
 # QC checks
 # -------------------------
-def qc_one_file(fif_path: Path) -> dict:
-    events_csv, meta_json = find_sidecars(fif_path)
+def qc_one_file(fif_path: Path) -> tuple[dict, pd.DataFrame]:
+    events_csv, meta_json, base = find_sidecars(fif_path)
     raw = mne.io.read_raw_fif(fif_path, preload=False, verbose="ERROR")
 
     # Basic info
@@ -156,11 +388,58 @@ def qc_one_file(fif_path: Path) -> dict:
     unique_ok = (len(set(ch_names)) == len(ch_names))
 
     # Checks: expected channel types
-    eeg_count = len(mne.pick_types(raw.info, eeg=True, meg=False))
+    eeg_picks = mne.pick_types(raw.info, eeg=True, meg=False, eog=False, stim=False, misc=False)
+    eeg_count = len(eeg_picks)
     has_only_eeg = (ch_types == {"eeg"})  # expected for your converted BNCI exports
 
-    # Amplitude sanity on demeaned EEG (robust to full-DC offsets)
-    amp = amplitude_stats_demeaned(raw, window_sec=AMP_QC_WINDOW_SEC)
+    # Per-channel stats and correlation (decimated; uses QC_WINDOW_SEC or full recording)
+    ch_stats = compute_channel_stats(raw, picks=eeg_picks, window_sec=QC_WINDOW_SEC, max_samples=MAX_SAMPLES_FOR_STATS)
+    ch_corr = compute_mean_abs_correlation(raw, picks=eeg_picks, window_sec=QC_WINDOW_SEC, max_samples=MAX_SAMPLES_FOR_STATS)
+
+    # Merge for unified channel-level output
+    ch_df = ch_stats.merge(ch_corr, on=["ch_name", "qc_window_sec", "qc_samples_used", "decim"], how="left")
+    ch_df.insert(0, "fif", str(fif_path))
+    ch_df.insert(1, "fif_base", base)
+
+    # --- Robust dead/near-dead channel detection (relative to run) ---
+    EPS = 1e-20  # prevent divide-by-zero
+    robust_std_ref = float(np.median(ch_df["std_v"].to_numpy()))
+    robust_ptp_ref = float(np.median(ch_df["ptp_v"].to_numpy()))
+    robust_mad_ref = float(np.median(ch_df["mad_v"].to_numpy()))
+
+    # Ratios vs typical channel in this run
+    ch_df["std_ratio_to_median"] = ch_df["std_v"] / (robust_std_ref + EPS)
+    ch_df["ptp_ratio_to_median"] = ch_df["ptp_v"] / (robust_ptp_ref + EPS)
+    ch_df["mad_ratio_to_median"] = ch_df["mad_v"] / (robust_mad_ref + EPS)
+
+    ch_df["flag_flat_or_dead"] = (
+        (ch_df["var_v2"] < NEAR_ZERO_VAR)
+        | (ch_df["std_v"] < STD_MIN_V)
+        | (ch_df["std_ratio_to_median"] < DEAD_STD_RATIO)
+        | (ch_df["ptp_ratio_to_median"] < DEAD_PTP_RATIO)
+        | (ch_df["mad_ratio_to_median"] < DEAD_MAD_RATIO)
+    )
+
+    # Channel flags
+    ch_df["flag_std_high"] = ch_df["std_v"] > STD_MAX_V
+    ch_df["flag_ptp_high"] = ch_df["ptp_v"] > PTP_MAX_V
+    ch_df["flag_mad_high"] = ch_df["mad_v"] > MAD_MAX_V
+    ch_df["flag_corr_low"] = ch_df["mean_abs_corr"] < MEAN_ABS_CORR_MIN
+    ch_df["flag_corr_high"] = ch_df["mean_abs_corr"] > MEAN_ABS_CORR_MAX
+
+    ch_df["any_flag"] = ch_df[
+        [
+            "flag_flat_or_dead",
+            "flag_std_high",
+            "flag_ptp_high",
+            "flag_mad_high",
+            "flag_corr_low",
+            "flag_corr_high",
+        ]
+    ].any(axis=1)
+
+    # Summarize flagged channels
+    flagged_channels = ch_df.loc[ch_df["any_flag"], "ch_name"].tolist()
 
     # Events checks
     codes_present = set()
@@ -170,8 +449,29 @@ def qc_one_file(fif_path: Path) -> dict:
         in_bounds_ok = bool(((events_df["sample0"] >= 0) & (events_df["sample0"] < n_times)).all())
     expected_codes_ok = (codes_present.issubset(EXPECTED_EVENT_CODES)) if codes_present else True
 
+    # Save plots (to per-file folder)
+    per_file_plot_dir = PLOTS_DIR / "by_run" / base
+    per_file_plot_dir.mkdir(parents=True, exist_ok=True)
+
+    if SAVE_RAW_SNIPPET_PLOT:
+        save_raw_snippet_plot(raw, base, PLOTS_RAW_SNIPPET_DIR, duration_sec=RAW_SNIPPET_SEC, max_channels=None)
+        save_raw_snippet_plot(raw, base, per_file_plot_dir, duration_sec=RAW_SNIPPET_SEC, max_channels=None)
+
+    save_raw_overview_plot(raw, base, PLOTS_RAW_OVERVIEW_DIR, max_points=20000, max_channels=None)
+    save_raw_overview_plot(raw, base, per_file_plot_dir, max_points=20000, max_channels=None)
+
+    if SAVE_PSD_PLOT:
+        save_psd_plot(raw, base, PLOTS_PSD_DIR, fmin=PSD_FMIN, fmax=PSD_FMAX)
+        save_psd_plot(raw, base, per_file_plot_dir, fmin=PSD_FMIN, fmax=PSD_FMAX)
+
+    if SAVE_EVENTS_PLOT:
+        save_events_plot(events_df, sfreq=sfreq, fif_base=base, out_dir=PLOTS_EVENTS_DIR)
+        save_events_plot(events_df, sfreq=sfreq, fif_base=base, out_dir=per_file_plot_dir)
+
+
     report = {
         "fif": str(fif_path),
+        "fif_base": base,
         "sfreq": sfreq,
         "nchan": nchan,
         "eeg_count": eeg_count,
@@ -180,8 +480,6 @@ def qc_one_file(fif_path: Path) -> dict:
         "unique_ch_names": unique_ok,
         "channel_types": sorted(list(ch_types)),
         "only_eeg_types": has_only_eeg,
-        # Robust amplitude QC (demeaned)
-        **amp,
         "events_csv_exists": events_csv.exists(),
         "meta_json_exists": meta_json.exists(),
         "n_events": int(len(events_df)) if len(events_df) else 0,
@@ -190,20 +488,17 @@ def qc_one_file(fif_path: Path) -> dict:
         "events_in_bounds": in_bounds_ok,
         "meta_input_units": meta.get("input_units"),
         "meta_stored_units": meta.get("stored_units"),
+        # QC settings used
+        "qc_window_sec": float(QC_WINDOW_SEC) if QC_WINDOW_SEC is not None else np.nan,
+        "max_samples_for_stats": int(MAX_SAMPLES_FOR_STATS),
+        # Channel flag summary
+        "n_flagged_channels": int(len(flagged_channels)),
+        "flagged_channels": ";".join(flagged_channels[:50]) + (";..." if len(flagged_channels) > 50 else ""),
+        # Plot outputs
+        "plots_dir": str(per_file_plot_dir),
     }
 
-    # Optional plots (interactive)
-    if SHOW_RAW_PLOT:
-        raw.plot(duration=RAW_PLOT_DURATION_SEC, n_channels=min(20, nchan), scalings="auto", show=True)
-
-    if SHOW_PSD_PLOT:
-        raw.compute_psd(fmin=0.1, fmax=40).plot(show=True)
-
-    if SHOW_EVENTS_PLOT and len(events_df) > 0:
-        events = events_df_to_mne_events(events_df, sample_col="sample0")
-        mne.viz.plot_events(events, sfreq=sfreq, first_samp=0, show=True)
-
-    return report
+    return report, ch_df
 
 
 def main():
@@ -212,20 +507,22 @@ def main():
         raise FileNotFoundError(f"No FIF files found under {RAW_FIF_ROOT}")
 
     print(f"Found {len(fif_files)} FIF files under: {RAW_FIF_ROOT}\n")
+    print(f"QC outputs will be written to: {QC_OUT_ROOT.resolve()}\n")
 
     reports = []
-    for p in fif_files:
-        rep = qc_one_file(p)
-        reports.append(rep)
+    channel_rows = []
 
-        # Quick per-file summary line
+    for p in fif_files:
+        rep, ch_df = qc_one_file(p)
+        reports.append(rep)
+        channel_rows.append(ch_df)
+
         print(
             f"{Path(rep['fif']).name} | "
-            f"{rep['nchan']} ch | {rep['sfreq']} Hz | {rep['duration_sec']:.1f}s | "
-            f"{rep['n_events']} events | codes={rep['codes_present']}"
+            f"{rep['eeg_count']} EEG ch | {rep['sfreq']} Hz | {rep['duration_sec']:.1f}s | "
+            f"{rep['n_events']} events | flagged_ch={rep['n_flagged_channels']}"
         )
 
-        # Flag obvious problems
         problems = []
         if not rep["unique_ch_names"]:
             problems.append("duplicate channel names")
@@ -239,27 +536,19 @@ def main():
             problems.append("events out of bounds")
         if not rep["expected_codes_subset"]:
             problems.append(f"unexpected event codes {rep['codes_present']}")
-
-        # Amplitude checks (demeaned) — robust to full DC offsets
-        med = rep["demeaned_median_abs_v_firstwin"]
-        p999 = rep["demeaned_p999_abs_v_firstwin"]
-        mx = rep["demeaned_max_abs_v_firstwin"]
-        mx_ch = rep["demeaned_max_channel_firstwin"]
-
-        if np.isfinite(med) and med > DEMEANED_MEDIAN_WARN_V:
-            problems.append(f"demeaned median high ({med:.2e} V)")
-        if np.isfinite(p999) and p999 > DEMEANED_P999_WARN_V:
-            problems.append(f"demeaned p99.9 high ({p999:.2e} V)")
-        if np.isfinite(mx) and mx > DEMEANED_MAX_WARN_V:
-            problems.append(f"demeaned max spike ({mx:.2e} V @ {mx_ch})")
+        if rep["n_flagged_channels"] > 0:
+            problems.append(f"{rep['n_flagged_channels']} flagged EEG channels")
 
         if problems:
             print("  ⚠️  QC flags:", "; ".join(problems))
 
-    # Write a QC summary CSV for easy scanning
-    out_csv = Path("datasets/bnci_horizon_2020_ErrP/qc_summary.csv")
-    pd.DataFrame(reports).to_csv(out_csv, index=False)
-    print(f"\nWrote QC summary: {out_csv.resolve()}")
+    # Write summary CSVs
+    pd.DataFrame(reports).to_csv(QC_SUMMARY_CSV, index=False)
+    print(f"\nWrote QC summary: {QC_SUMMARY_CSV.resolve()}")
+
+    all_ch = pd.concat(channel_rows, ignore_index=True) if channel_rows else pd.DataFrame()
+    all_ch.to_csv(QC_CHANNEL_CSV, index=False)
+    print(f"Wrote per-channel QC: {QC_CHANNEL_CSV.resolve()}")
 
 
 if __name__ == "__main__":
