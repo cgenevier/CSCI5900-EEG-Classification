@@ -4,13 +4,13 @@ import mne
 # -------------------------
 # Config
 # -------------------------
-PREPROC_ROOT = Path("datasets/bnci_horizon_2020_ErrP/preprocessed_fif/car_fir_causal_bp-0.3-30_sfreq256/sub-01/ses-01")
+PREPROC_ROOT = Path("datasets/bnci_horizon_2020_ErrP/preprocessed_fif")
 EPOCHS_ROOT  = Path("datasets/bnci_horizon_2020_ErrP/epoched_fif")
 
 # Define epoch variants here (ms → seconds)
 EPOCH_VARIANTS = {
     "tmin-200ms_tmax600ms": {"tmin": -0.200, "tmax": 0.600, "baseline": (-0.2, 0)},
-    "tmin0ms_tmax800ms":   {"tmin":  0.000, "tmax": 0.800, "baseline": (None, 0)},
+    "tmin0ms_tmax800ms":   {"tmin":  0.000, "tmax": 0.800, "baseline": None},
 }
 
 # -------------------------

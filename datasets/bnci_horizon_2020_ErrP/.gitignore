@@ -6,5 +6,9 @@ bids/*
 !bids/**/.gitkeep
 preprocessed_fif/*
 !preprocessed_fif/**/.gitkeep
+epoched_fif/*
+!epoched_fif/**/.gitkeep
+epoched_fif_clean/*
+!epoched_fif_clean/**/.gitkeep
 qc_outputs/*
 !qc_outputs/**/.gitkeep

@@ -76,6 +76,25 @@ def parse_structure(epo_path: Path) -> tuple[Path, str]:
 
     return rel_dir, base
 
+def parse_rel_dir_bits(rel_dir: Path) -> dict:
+    """
+    rel_dir is like: <epoch_variant>/<preproc_variant>/sub-XX/ses-YY
+    We'll extract those pieces if present.
+    """
+    parts = rel_dir.parts
+    out = {
+        "epoch_variant": parts[0] if len(parts) > 0 else "unk",
+        "preproc_variant": parts[1] if len(parts) > 1 else "unk",
+        "sub": "sub-unk",
+        "ses": "ses-unk",
+    }
+    for p in parts:
+        if p.startswith("sub-"):
+            out["sub"] = p
+        elif p.startswith("ses-"):
+            out["ses"] = p
+    return out
+
 
 def robust_z(x: np.ndarray) -> np.ndarray:
     """
@@ -114,6 +133,7 @@ def main():
     print(f"Found {len(epo_files)} epoch files under: {EPOCHS_ROOT.resolve()}")
     print(f"Writing cleaned epochs under: {OUT_ROOT.resolve()}")
 
+    all_qc_rows: list[dict] = []
     for epo_path in epo_files:
         rel_dir, base = parse_structure(epo_path)
         print(f"\nQC: {base}")
@@ -172,6 +192,9 @@ def main():
             "rms_z_cutoff": float(RMS_Z_CUTOFF) if RMS_TOP_PCT is None else np.nan,
             "rms_top_pct": float(RMS_TOP_PCT) if RMS_TOP_PCT is not None else np.nan,
         }
+        qc.update(parse_rel_dir_bits(rel_dir))
+        qc["base"] = base
+        all_qc_rows.append(qc)
 
         # add some summary stats if available
         if rms is not None and len(rms) > 0:
@@ -189,10 +212,52 @@ def main():
                 rms_outlier_indices="[]",
             )
 
-        qc_path = out_dir / f"{base}-epo-qc.csv"
-        pd.DataFrame([qc]).to_csv(qc_path, index=False)
-        print(f"  Saved QC CSV: {qc_path}")
 
+    # -------------------------
+    # Write overview summaries
+    # -------------------------
+    if all_qc_rows:
+        df_all = pd.DataFrame(all_qc_rows)
+
+        overview_all_path = OUT_ROOT / "qc_overview_all_runs.csv"
+        df_all.to_csv(overview_all_path, index=False)
+        print(f"\nWrote overview (all runs): {overview_all_path}")
+
+        # Helpful derived columns
+        df_all["drop_bad_rate"] = np.where(
+            df_all["n_epochs_in"] > 0,
+            df_all["n_dropped_drop_bad"] / df_all["n_epochs_in"],
+            np.nan,
+        )
+        df_all["total_drop_rate"] = np.where(
+            df_all["n_epochs_in"] > 0,
+            (df_all["n_epochs_in"] - df_all["n_epochs_out"]) / df_all["n_epochs_in"],
+            np.nan,
+        )
+
+        # Grouped totals (you can change group keys as you like)
+        group_cols = ["epoch_variant", "preproc_variant", "sub", "ses"]
+        df_summary = (
+            df_all
+            .groupby(group_cols, dropna=False, as_index=False)
+            .agg(
+                n_runs=("base", "count"),
+                n_epochs_in=("n_epochs_in", "sum"),
+                n_epochs_out=("n_epochs_out", "sum"),
+                n_dropped_drop_bad=("n_dropped_drop_bad", "sum"),
+                n_dropped_rms_outlier=("n_dropped_rms_outlier", "sum"),
+            )
+        )
+        df_summary["total_drop_rate"] = np.where(
+            df_summary["n_epochs_in"] > 0,
+            (df_summary["n_epochs_in"] - df_summary["n_epochs_out"]) / df_summary["n_epochs_in"],
+            np.nan,
+        )
+
+        overview_summary_path = OUT_ROOT / "qc_overview_summary.csv"
+        df_summary.to_csv(overview_summary_path, index=False)
+        print(f"Wrote overview (grouped summary): {overview_summary_path}")
+        
     print("\nDone.")
 
 
