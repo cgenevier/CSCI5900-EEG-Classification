@@ -43,7 +43,7 @@ ONLY_RUN = None       # e.g., "01"
 
 # Filtering Variations
 VARIATIONS = {
-    "car_fir_causal_bp-0.1-30_sfreq256": {
+    "car_fir_causal_bp-0.1-30": {
         "rereference": "average",
         "l_freq": 0.1,
         "h_freq": 30.0,
@@ -52,7 +52,7 @@ VARIATIONS = {
         "target_sfreq": 256.0,
         "ica": False,
     },
-    "car_fir_causal_bp-0.3-30_sfreq256": {
+    "car_fir_causal_bp-0.3-30": {
         "rereference": "average",
         "l_freq": 0.3,
         "h_freq": 30.0,
@@ -61,7 +61,7 @@ VARIATIONS = {
         "target_sfreq": 256.0,
         "ica": False,
     },
-    "car_fir_causal_bp-1-10_sfreq256": {
+    "car_fir_causal_bp-1-10": {
         "rereference": "average",
         "l_freq": 1.0,
         "h_freq": 10.0,
@@ -70,7 +70,7 @@ VARIATIONS = {
         "target_sfreq": 256.0,
         "ica": False,
     },
-    "car_fir_causal_bp-0.3-30_sfreq256_ica": {
+    "car_fir_causal_bp-0.3-30_ica": {
         "rereference": "average",
         "l_freq": 0.3,
         "h_freq": 30.0,
@@ -78,8 +78,8 @@ VARIATIONS = {
         "downsample": False,
         "target_sfreq": 256.0,
         "ica": True,
-        "ica_method": "infomax",
-        "ica_n_components": 0.99,
+        "ica_method": "fastica",
+        "ica_n_components": 0.95,
         "ica_random_state": 97,
         "ica_max_iter": "auto",
         "ica_eog_proxy_candidates": ["Fp1", "Fp2", "AF7", "AF8", "AF3", "AF4"],
@@ -135,6 +135,8 @@ def preprocess_one_file(fif_path: Path, flagged_map: dict[str, list[str]]) -> No
     # Create each variant from the same starting point (post-drop).
     for variant_name, variant_config in VARIATIONS.items():
         variant_dir = OUT_ROOT / variant_name
+        out_dir = variant_dir / sub / ses
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         # create a copy of the raw data
         r = raw.copy()
@@ -157,7 +159,7 @@ def preprocess_one_file(fif_path: Path, flagged_map: dict[str, list[str]]) -> No
 
             # b) Fit ICA
             ica = preprocessing.ICA(n_components=variant_config["ica_n_components"], method=variant_config["ica_method"], random_state=variant_config["ica_random_state"], max_iter=variant_config["ica_max_iter"])
-            ica.fit(r_fit, verbose="ERROR")
+            ica.fit(r_fit, decim=3, verbose="ERROR")
 
             # c) Auto-detect blink-ish components using a proxy channel (EEG-only data)
             candidates = variant_config["ica_eog_proxy_candidates"]
@@ -185,8 +187,6 @@ def preprocess_one_file(fif_path: Path, flagged_map: dict[str, list[str]]) -> No
                 print("  ICA excluded components: none (auto-detection found none or no proxy channel).")
 
         # Save the preprocessed raw data
-        out_dir = variant_dir / sub / ses
-        out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{base}_raw.fif"
         r.save(out_path, overwrite=True, verbose="ERROR")
         print(f"  Saved: {out_path}")
