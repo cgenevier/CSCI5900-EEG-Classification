@@ -4,7 +4,7 @@ import mne
 # -------------------------
 # Config
 # -------------------------
-PREPROC_ROOT = Path("datasets/bnci_horizon_2020_ErrP/preprocessed_fif")
+PREPROC_ROOT = Path("datasets/bnci_horizon_2020_ErrP/preprocessed_fif/car_fir_causal_bp-0.3-30_sfreq256/sub-01/ses-01")
 EPOCHS_ROOT  = Path("datasets/bnci_horizon_2020_ErrP/epoched_fif")
 
 # Define epoch variants here (ms → seconds)
@@ -40,6 +40,12 @@ def main():
         print(f"\nLoading: {base}")
 
         raw = mne.io.read_raw_fif(raw_path, preload=True, verbose="ERROR")
+
+        print("n_annotations:", len(raw.annotations))
+        print("annotation descriptions:", sorted(set(raw.annotations.description))[:30])
+        events, event_id = mne.events_from_annotations(raw)
+        print("n_events:", len(events))
+        print("event_id keys:", list(event_id)[:20])
 
         # Events from annotations (BNCI ErrP style)
         events, event_id = mne.events_from_annotations(raw)

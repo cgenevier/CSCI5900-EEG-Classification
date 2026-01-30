@@ -51,7 +51,8 @@ EVENT_ID = {
     "8": 8,
     "error_9": 9,
     "correct_10": 10,
-}
+}# Put this near your EVENT_ID
+CODE_TO_DESC = {v: k for k, v in EVENT_ID.items()}  # 5 -> "correct_5", etc.
 
 DEFAULT_CH_TYPE = "eeg"
 ASSUME_MICROVOLTS = True # BNCI ErrP dataset is stored in microvolts
@@ -258,6 +259,11 @@ def mat_to_mne_per_run(mat_path: Path):
                     events_df["code"].astype(int).to_numpy(),
                 ]
             )
+            # Attach to raw as annotations so FIF carries events
+            onsets = events_df["sample0"].astype(float).to_numpy() / float(sfreq)  # seconds
+            durations = np.zeros(len(events_df), dtype=float)
+            descriptions = np.array([CODE_TO_DESC.get(int(c), str(int(c))) for c in events_df["code"].to_numpy()])
+            raw.set_annotations(mne.Annotations(onset=onsets, duration=durations, description=descriptions))
         else:
             events = np.zeros((0, 3), dtype=int)
 
